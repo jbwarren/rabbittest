@@ -18,43 +18,55 @@ import (
 //////////////////////////////////////////////////////////
 
 // publishes messages to queue on rabbit server at <url>
+// outputs counts of successful messages read on <counts>
 // runs until <quit> is signaled or <numMsgs> published (if numMsgs >= 0)
-// signals <done> when done
-func publisher(url, queue string, numMsgs int64, quit chan int, done *syncutil.Waiter) {
-	defer done.Done() // signal when done
+// closes <counts> when done
+func startPublisher(url, queue string, numMsgs int64, quit chan int) (counts chan int64) {
+	counts = make(chan int64, 1000)
 
-	// connect to server
-	conn := dial(url)
-	defer conn.Close()
-	ch := channel(conn)
-	defer ch.Close()
+	// define worker routine
+	publisher := func() {
+		defer close(counts) // signal when done
 
-	// declare queue (create if non-existent)
-	// QueueDeclare(name, durable, autoDelete, exclusive, noWait, args)
-	q := queuedeclare(ch, queue, false, false, false, false, nil)
-	fmt.Printf("PUBLISHER:  queue '%s' has %d messages to start\n", queue, q.Messages)
+		// connect to server
+		conn := dial(url)
+		defer conn.Close()
+		ch := channel(conn)
+		defer ch.Close()
 
-	// loop, publishing messages
-	var i int64
-loop:
-	for ; numMsgs < 0 || i < numMsgs; i++ { // stop after numMsgs if >=0
-		select {
-		case <-quit: // quit signaled?
-			fmt.Println("PUBLISHER:  got quit signal")
-			break loop // not just the select
-		default: // publish msg
-			msg := amqp.Publishing{
-				DeliveryMode: amqp.Transient,
-				Timestamp:    time.Now(),
-				ContentType:  "text/plain",
-				Body:         []byte(fmt.Sprintf("Hello! (%v)", i)),
+		// declare queue (create if non-existent)
+		// QueueDeclare(name, durable, autoDelete, exclusive, noWait, args)
+		q := queuedeclare(ch, queue, false, false, false, false, nil)
+		fmt.Printf("PUBLISHER:  queue '%s' has %d messages to start\n", queue, q.Messages)
+
+		// loop, publishing messages
+		var i int64
+	loop:
+		for numMsgs < 0 || i < numMsgs { // stop after numMsgs if >=0
+			select {
+			case <-quit: // quit signaled?
+				fmt.Println("PUBLISHER:  got quit signal")
+				break loop // not just the select
+			default: // publish msg
+				msg := amqp.Publishing{
+					DeliveryMode: amqp.Transient,
+					Timestamp:    time.Now(),
+					ContentType:  "text/plain",
+					Body:         []byte(fmt.Sprintf("Hello! (%v)", i)),
+				}
+				// Publish(exchange, key, mandatory, immediate, msg)
+				publish(ch, "", queue, true, false, msg)
+				i++
+				counts <- i
 			}
-			// Publish(exchange, key, mandatory, immediate, msg)
-			publish(ch, "", queue, true, false, msg)
 		}
+
+		fmt.Printf("PUBLISHER:  %v msgs sent successfully; exiting\n", i)
 	}
 
-	fmt.Printf("PUBLISHER:  %v msgs sent successfully; exiting\n", i)
+	// start worker routine
+	go publisher()
+	return
 }
 
 //////////////////////////////////////////////////////////
@@ -66,7 +78,7 @@ loop:
 // runs until <quit> is signaled or <numMsgs> read (if numMsgs >= 0)
 // closes <counts> when done
 func startConsumer(url, queue string, numMsgs int64, quit chan int) (counts chan int64) {
-	counts = make(chan int64, 100)
+	counts = make(chan int64, 1000)
 
 	// define worker routine
 	consumer := func() {
@@ -78,8 +90,9 @@ func startConsumer(url, queue string, numMsgs int64, quit chan int) (counts chan
 		ch := channel(conn)
 		defer ch.Close()
 
-		// check queue
-		q := queueinspect(ch, queue)
+		// declare queue (create if non-existent)
+		// QueueDeclare(name, durable, autoDelete, exclusive, noWait, args)
+		q := queuedeclare(ch, queue, false, false, false, false, nil)
 		fmt.Printf("CONSUMER:  queue '%s' has %d messages to start\n", queue, q.Messages)
 
 		// Consume(queue, consumer, autoAck, exclusive, noLocal, noWait, args)
@@ -108,16 +121,20 @@ func startConsumer(url, queue string, numMsgs int64, quit chan int) (counts chan
 	return
 }
 
+///////////////////////////////////////////
+// counter
+///////////////////////////////////////////
+
 // drains the <counts> channel, printing every so often
 // runs until <counts> channel is closed
 // signals <done> when done
-func counter(counts chan int64, done *syncutil.Waiter) {
+func counter(counts chan int64, every int64, label string, done *syncutil.Waiter) {
 	defer done.Done() // signal when done
 
 	// drain counts
 	for i := range counts {
-		if i%1000 == 0 {
-			fmt.Printf("Got %v msgs\n", i)
+		if i%every == 0 {
+			fmt.Printf("STATS:  %v msgs successfully %s\n", i, label)
 		}
 	}
 }
@@ -129,6 +146,7 @@ func counter(counts chan int64, done *syncutil.Waiter) {
 func main() {
 	const URL string = "amqp://guest:guest@localhost"
 	const QUEUE string = "test"
+	const COUNT_EVERY int64 = 1000
 
 	// get cmdline options
 	numMsgs, publish, consume, wait, ok := parseCmdLine()
@@ -137,37 +155,47 @@ func main() {
 		return
 	}
 
-	// start routines to publish/consume
+	// start pipelines to publish/consume
 	quit := make(chan int)
 	var done syncutil.Waiter
 	if publish {
-		done.Add(1)                                    // he who goes, adds (first)
-		go publisher(URL, QUEUE, numMsgs, quit, &done) // runs until told to quit if numMsgs < 0
+		counts := startPublisher(URL, QUEUE, numMsgs, quit) // runs until told to quit if numMsgs < 0
+		done.Add(1)                                         // he who goes, adds (first)
+		go counter(counts, COUNT_EVERY, "published", &done) // runs until <counts> closed (upstream)
 		if wait {
-			done.Wait() // wait for publisher to quit before proceeding
+			// wait for pipeline to be done before proceeding
+			waitWithInterrupt(&done, func() { quit <- 0 }) // signal quit on SIGINT (only one routine to signal, and we may need it later)
 		}
 	}
 	if consume {
 		counts := startConsumer(URL, QUEUE, numMsgs, quit) // runs until told to quit if numMsgs < 0
 		done.Add(1)                                        // he who goes, adds (first)
-		go counter(counts, &done)                          // runs until <counts> closed (upstream)
+		go counter(counts, COUNT_EVERY, "consumed", &done) // runs until <counts> closed (upstream)
 	}
 
-	// handle SIGINT/SIGTERM
+	// wait for everything to complete, and handle SIGINT
+	waitWithInterrupt(&done, func() { close(quit) }) // close quit on SIGINT (perhaps multiple routines to signal)
+}
+
+// waits for <waitfor> before returning
+// handles SIGINT by calling <oninterrupt>() (and keeps waiting)
+// will only call <oninterrupt>() once, even if multiple SIGINTs
+func waitWithInterrupt(waitfor *syncutil.Waiter, oninterrupt func()) {
+	// register for SIGINT notifications
 	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM) // register for these syscalls
+	signal.Notify(sigs, syscall.SIGINT)
 
 	// wait for signal or completion
-	donech := done.Channel() // allows us to use it in select{}
+	wait_ch := waitfor.Channel() // allows us to use it in select{}
 	var once sync.Once
 	for {
 		select {
-		case <-sigs: // SIGINT/SIGTERM
+		case <-sigs: // SIGINT
 			once.Do(func() {
-				fmt.Println(" Quitting...")
-				close(quit) // tell routines to quit
+				fmt.Println(" Got SIGINT...")
+				oninterrupt()
 			})
-		case <-donech: // publish/consume routines done
+		case <-wait_ch: // done
 			return
 		}
 	}
