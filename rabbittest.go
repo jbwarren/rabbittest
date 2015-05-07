@@ -2,10 +2,14 @@ package main
 
 import (
 	"fmt"
+	"github.com/jbwarren/syncutil"
 	"github.com/streadway/amqp"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 )
 
@@ -14,10 +18,10 @@ import (
 //////////////////////////////////////////////////////////
 
 // publishes messages to queue on rabbit server at <url>
-// runs until <quit> is signaled or <numMsgs> published (if numMsgs > 0)
+// runs until <quit> is signaled or <numMsgs> published (if numMsgs >= 0)
 // signals <done> when done
-func publisher(url, queue string, numMsgs uint64, quit, done chan int) {
-	defer func() { done <- 0 }() // signal when done
+func publisher(url, queue string, numMsgs int64, quit chan int, done *syncutil.Waiter) {
+	defer done.Done() // signal when done
 
 	// connect to server
 	conn := dial(url)
@@ -27,12 +31,13 @@ func publisher(url, queue string, numMsgs uint64, quit, done chan int) {
 
 	// declare queue (create if non-existent)
 	// QueueDeclare(name, durable, autoDelete, exclusive, noWait, args)
-	_ = queuedeclare(ch, queue, false, false, false, false, nil)
+	q := queuedeclare(ch, queue, false, false, false, false, nil)
+	fmt.Printf("PUBLISHER:  queue '%s' has %d messages to start\n", queue, q.Messages)
 
 	// loop, publishing messages
-	var i uint64
+	var i int64
 loop:
-	for ; numMsgs > 0 && i < numMsgs; i++ { // stop after numMsgs if >0
+	for ; numMsgs < 0 || i < numMsgs; i++ { // stop after numMsgs if >=0
 		select {
 		case <-quit: // quit signaled?
 			fmt.Println("PUBLISHER:  got quit signal")
@@ -58,14 +63,14 @@ loop:
 
 // consumes messages from queue on rabbit server at <url>
 // outputs counts of successful messages read on <counts>
-// runs until <quit> is signaled
-// signals <done> when done
-func startConsumer(url, queue string, quit, done chan int) (counts chan uint64) {
-	counts = make(chan uint64, 100)
+// runs until <quit> is signaled or <numMsgs> read (if numMsgs >= 0)
+// closes <counts> when done
+func startConsumer(url, queue string, numMsgs int64, quit chan int) (counts chan int64) {
+	counts = make(chan int64, 100)
 
 	// define worker routine
 	consumer := func() {
-		defer func() { done <- 0 }() // signal when done
+		defer close(counts) // close when done
 
 		// connect to server
 		conn := dial(url)
@@ -73,12 +78,16 @@ func startConsumer(url, queue string, quit, done chan int) (counts chan uint64) 
 		ch := channel(conn)
 		defer ch.Close()
 
+		// check queue
+		q := queueinspect(ch, queue)
+		fmt.Printf("CONSUMER:  queue '%s' has %d messages to start\n", queue, q.Messages)
+
 		// Consume(queue, consumer, autoAck, exclusive, noLocal, noWait, args)
 		deliveries := consume(ch, queue, "", false, false, false, true, nil)
 		// read msgs until told to quit
-		var i uint64
+		var i int64
 	loop:
-		for {
+		for numMsgs < 0 || i < numMsgs { // stop after numMsgs if >= 0
 			select {
 			case <-quit: // quit signaled?
 				fmt.Println("CONSUMER:  got quit signal")
@@ -99,6 +108,20 @@ func startConsumer(url, queue string, quit, done chan int) (counts chan uint64) 
 	return
 }
 
+// drains the <counts> channel, printing every so often
+// runs until <counts> channel is closed
+// signals <done> when done
+func counter(counts chan int64, done *syncutil.Waiter) {
+	defer done.Done() // signal when done
+
+	// drain counts
+	for i := range counts {
+		if i%1000 == 0 {
+			fmt.Printf("Got %v msgs\n", i)
+		}
+	}
+}
+
 ///////////////////////////////////////////
 // main
 ///////////////////////////////////////////
@@ -114,35 +137,39 @@ func main() {
 		return
 	}
 
-	// start routines
-	quit, done := make(chan int), make(chan int)
+	// start routines to publish/consume
+	quit := make(chan int)
+	var done syncutil.Waiter
 	if publish {
-		go publisher(URL, QUEUE, numMsgs, quit, done)
+		done.Add(1)                                    // he who goes, adds (first)
+		go publisher(URL, QUEUE, numMsgs, quit, &done) // runs until told to quit if numMsgs < 0
 		if wait {
-			<-done // wait for publisher to quit
+			done.Wait() // wait for publisher to quit before proceeding
 		}
 	}
 	if consume {
-		counts := startConsumer(URL, QUEUE, quit, done)
+		counts := startConsumer(URL, QUEUE, numMsgs, quit) // runs until told to quit if numMsgs < 0
+		done.Add(1)                                        // he who goes, adds (first)
+		go counter(counts, &done)                          // runs until <counts> closed (upstream)
+	}
 
-		// drain counts
-		for i := range counts {
-			if i%1000 == 0 {
-				fmt.Printf("Got %v msgs\n", i)
-			}
-			if i >= numMsgs {
-				break
-			}
+	// handle SIGINT/SIGTERM
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM) // register for these syscalls
+
+	// wait for signal or completion
+	donech := done.Channel() // allows us to use it in select{}
+	var once sync.Once
+	for {
+		select {
+		case <-sigs: // SIGINT/SIGTERM
+			once.Do(func() {
+				fmt.Println(" Quitting...")
+				close(quit) // tell routines to quit
+			})
+		case <-donech: // publish/consume routines done
+			return
 		}
-	}
-
-	// shut down
-	if publish && !wait { // only wait for publisher to quit if it's running and we didn't already wait
-		<-done // wait for publisher to quit
-	}
-	if consume {
-		close(quit) // signal consumer to quit (publisher should have quit by now)
-		<-done      // wait for consumer to quit
 	}
 }
 
@@ -150,18 +177,17 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "USAGE:  rabbittest [<numMsgs> [publish|consume|publish{+|,}consume]]\n")
 }
 
-func parseCmdLine() (numMsgs uint64, publish, consume, wait, ok bool) {
-	// defaults
-	numMsgs = 10 * 1000
-	publish = true
-	consume = true
-	wait = false
-	ok = true
+func parseCmdLine() (numMsgs int64, publish, consume, wait, ok bool) {
+	ok = true // set to false if we encounter an error
 
 	args := os.Args[1:] // ignore program name
+	if len(args) < 1 {
+		fmt.Fprintf(os.Stderr, "ERROR:  too few arguments\n")
+		ok = false
+	}
 	if len(args) >= 1 { // parse numMsgs
 		var err error
-		numMsgs, err = strconv.ParseUint(args[0], 0, 64) // allow decimal, hex, or octal
+		numMsgs, err = strconv.ParseInt(args[0], 0, 64) // allow decimal, hex, or octal
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR parsing numMsgs:  %s\n", err.Error())
 			ok = false
@@ -169,13 +195,13 @@ func parseCmdLine() (numMsgs uint64, publish, consume, wait, ok bool) {
 	}
 	if len(args) >= 2 { // parse run mode
 		switch strings.ToUpper(args[1]) {
-		case "PUBLISH":
+		case "P", "PUBLISH":
 			publish, consume, wait = true, false, false
-		case "CONSUME":
+		case "C", "CONSUME":
 			publish, consume, wait = false, true, false
-		case "PUBLISH,CONSUME":
+		case "P,C", "P,CONSUME", "PUBLISH,C", "PUBLISH,CONSUME":
 			publish, consume, wait = true, true, true
-		case "PUBLISH+CONSUME", "PUBLISH&CONSUME", "CONSUME+PUBLISH", "CONSUME&PUBLISH":
+		case "P+C", "P+CONSUME", "PUBLISH+C", "PUBLISH+CONSUME":
 			publish, consume, wait = true, true, false
 		default:
 			fmt.Fprintf(os.Stderr, "ERROR:  invalid run mode:  '%s'\n", args[1])
@@ -216,6 +242,15 @@ func queuedeclare(ch *amqp.Channel, name string, durable, autoDelete, exclusive,
 	queue, err := ch.QueueDeclare(name, durable, autoDelete, exclusive, noWait, args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR from amqp.Channel.QueueDeclare():  %s\n", err.Error())
+		panic(err)
+	}
+	return
+}
+
+func queueinspect(ch *amqp.Channel, name string) (queue amqp.Queue) {
+	queue, err := ch.QueueInspect(name)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR from amqp.Channel.QueueInspect():  %s\n", err.Error())
 		panic(err)
 	}
 	return
