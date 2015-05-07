@@ -174,26 +174,30 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Fprintf(os.Stderr, "USAGE:  rabbittest [<numMsgs> [publish|consume|publish{+|,}consume]]\n")
+	fmt.Fprintf(os.Stderr, "USAGE:  rabbittest <numMsgs> {{p|publish} | {c|consume} | {p|publish}{+|,}{c|consume}}\n")
 }
 
 func parseCmdLine() (numMsgs int64, publish, consume, wait, ok bool) {
 	ok = true // set to false if we encounter an error
 
 	args := os.Args[1:] // ignore program name
-	if len(args) < 1 {
+	switch {
+	case len(args) < 2:
 		fmt.Fprintf(os.Stderr, "ERROR:  too few arguments\n")
 		ok = false
-	}
-	if len(args) >= 1 { // parse numMsgs
+	case len(args) > 2:
+		fmt.Fprintf(os.Stderr, "ERROR:  too many arguments\n")
+		ok = false
+	case len(args) == 2:
+		// parse numMsgs
 		var err error
 		numMsgs, err = strconv.ParseInt(args[0], 0, 64) // allow decimal, hex, or octal
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR parsing numMsgs:  %s\n", err.Error())
 			ok = false
 		}
-	}
-	if len(args) >= 2 { // parse run mode
+
+		// parse run mode
 		switch strings.ToUpper(args[1]) {
 		case "P", "PUBLISH":
 			publish, consume, wait = true, false, false
@@ -207,10 +211,6 @@ func parseCmdLine() (numMsgs int64, publish, consume, wait, ok bool) {
 			fmt.Fprintf(os.Stderr, "ERROR:  invalid run mode:  '%s'\n", args[1])
 			ok = false
 		}
-	}
-	if len(args) > 2 {
-		fmt.Fprintf(os.Stderr, "ERROR:  too many arguments\n")
-		ok = false
 	}
 
 	return
