@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"github.com/jbwarren/amqputil"
 	"github.com/jbwarren/syncutil"
 	"github.com/streadway/amqp"
 	"os"
@@ -19,54 +20,136 @@ import (
 
 // publishes messages to queue on rabbit server at <url>
 // outputs counts of successful messages read on <counts>
-// runs until <quit> is signaled or <numMsgs> published (if numMsgs >= 0)
-// closes <counts> when done
-func startPublisher(url, queue string, numMsgs int64, quit chan int) (counts chan int64) {
+// runs until <quit> is signaled or <numToSend> published (if numToSend >= 0)
+// closes <counts> and signals <done> when done
+func startPublisher(url, queue string, numToSend int64, quit chan int, done *syncutil.Waiter) (counts chan int64) {
 	counts = make(chan int64, 1000)
 
 	// define worker routine
-	publisher := func() {
-		defer close(counts) // signal when done
+	manager := func() {
+		defer close(counts) // close when done
+		defer done.Done()   // signal when done
 
 		// connect to server
-		conn := dial(url)
+		// dial(url, blockings, cancels, closings, flows, returns)
+		conn := dial(url, true, true, true, true, true)
 		defer conn.Close()
-		ch := channel(conn)
-		defer ch.Close()
+		ch := conn.Channel
+
+		// watch for server blocking (TCP flow control) in separate routine
+		done.Add(1)                                         // he who goes, adds (first)
+		go blockingAgent("PUBLISHER", conn.Blockings, done) // blockings channel will close when connection closed
 
 		// declare queue (create if non-existent)
 		// QueueDeclare(name, durable, autoDelete, exclusive, noWait, args)
 		q := queuedeclare(ch, queue, false, false, false, false, nil)
 		fmt.Printf("PUBLISHER:  queue '%s' has %d messages to start\n", queue, q.Messages)
 
-		// loop, publishing messages
-		var i int64
+		// start publisher routine
+		// so we can handle events while Publish() call is blocking
+		// lock-step signaling (req/rep pattern)
+		msgs := make(chan *amqp.Publishing) // capacity=0 so we're never queuing requests internally
+		presults := make(chan error, 1)     // capacity=1 so we can queue one response (so publisher can exit after event loop exits)
+		defer close(msgs)                   // will signal routine to stop
+		done.Add(1)                         // he who goes, adds (first)
+		go publisher(ch, queue, msgs, presults, done)
+
+		// for managing event loop
+		var num int64 = 0                        // num successfully sent
+		pausing := false                         // in flow control?
+		ready := true                            // publisher ready for msg?
+		handlePublishResult := func(err error) { // so we can use it both in and after the event loop
+			ready = true // for next publish
+			switch {
+			case err == nil: // successful publish
+				num++
+				counts <- num
+			case err != nil: // error
+				fmt.Printf("PUBLISHER:  got error from Publish(): %s\n", err.Error())
+			}
+		}
+
+		// event loop
 	loop:
-		for numMsgs < 0 || i < numMsgs { // stop after numMsgs if >=0
+		for numToSend < 0 || num < numToSend { // stop after numMsgs if >=0
 			select {
 			case <-quit: // quit signaled?
 				fmt.Println("PUBLISHER:  got quit signal")
 				break loop // not just the select
-			default: // publish msg
-				msg := amqp.Publishing{
-					DeliveryMode: amqp.Transient,
-					Timestamp:    time.Now(),
-					ContentType:  "text/plain",
-					Body:         []byte(fmt.Sprintf("Hello! (%v)", i)),
+			case c := <-ch.Cancels: // basic.cancel on channel
+				fmt.Printf("PUBLISHER:  got basic.cancel on '%s'\n", c)
+				break loop // not just the select
+			case c := <-ch.Closings: // connection or channel exception
+				fmt.Printf("PUBLISHER:  got connection/channel exception: %v\n", c)
+				break loop // not just the select
+			case f := <-ch.Flows: // basic.flow methods (RabbitMQ does TCP blocking instead)
+				if f {
+					fmt.Println("PUBLISHER:  got basic.flow=true; pausing...")
+				} else {
+					fmt.Println("PUBLISHER:  got basic.flow=false; resuming...")
 				}
-				// Publish(exchange, key, mandatory, immediate, msg)
-				publish(ch, "", queue, true, false, msg)
-				i++
-				counts <- i
+				pausing = f
+			case r := <-ch.Returns: // basic.return = msg undeliverable
+				fmt.Printf("PUBLISHER:  got basic.return (msg undeliverable): %s\n", r.Body)
+			case e := <-presults: // result from publisher
+				handlePublishResult(e)
+			default: // no signals/events
+				switch {
+				case pausing:
+					time.Sleep(time.Millisecond)
+				case !ready:
+					time.Sleep(time.Microsecond)
+				default:
+					msgs <- &amqp.Publishing{
+						DeliveryMode: amqp.Transient,
+						Timestamp:    time.Now(),
+						ContentType:  "text/plain",
+						Body:         []byte(fmt.Sprintf("Hello! (%v)", num)),
+					}
+					ready = false
+				}
 			}
 		}
 
-		fmt.Printf("PUBLISHER:  %v msgs sent successfully; exiting\n", i)
+		// get the last result from publisher
+		if !ready { // waiting for publisher?
+			e := <-presults
+			handlePublishResult(e)
+		}
+
+		fmt.Printf("PUBLISHER:  %v msgs sent successfully; exiting\n", num)
 	}
 
 	// start worker routine
-	go publisher()
+	done.Add(1) // he who goes, adds (first)
+	go manager()
 	return
+}
+
+// watches for connection blocking events
+// reads until <blockings> channel is closed (probably at connection close)
+// signals <done> when done
+func blockingAgent(label string, blockings chan amqp.Blocking, done *syncutil.Waiter) {
+	defer done.Done() // signal when done
+
+	// watch flor blocking events
+	for b := range blockings {
+		fmt.Printf("%s:  got connection Blocking event, active=%v, reason='%s'\n", label, b.Active, b.Reason)
+	}
+}
+
+// publishes to queue
+// reads input from <msgs>, writes results to <errors>
+// reads until <msgs> closed
+// signals <done> on exit
+func publisher(ch *amqputil.Channel, queue string, msgs chan *amqp.Publishing, errs chan error, done *syncutil.Waiter) {
+	defer done.Done() // signal when done
+
+	// publish from input
+	for msg := range msgs {
+		// Publish(exchange, key, mandatory, immediate, msg)
+		errs <- ch.Ch.Publish("", queue, true, false, *msg)
+	}
 }
 
 //////////////////////////////////////////////////////////
@@ -76,19 +159,20 @@ func startPublisher(url, queue string, numMsgs int64, quit chan int) (counts cha
 // consumes messages from queue on rabbit server at <url>
 // outputs counts of successful messages read on <counts>
 // runs until <quit> is signaled or <numMsgs> read (if numMsgs >= 0)
-// closes <counts> when done
-func startConsumer(url, queue string, numMsgs int64, quit chan int) (counts chan int64) {
+// closes <counts> and signals <done> when done
+func startConsumer(url, queue string, numMsgs int64, quit chan int, done *syncutil.Waiter) (counts chan int64) {
 	counts = make(chan int64, 1000)
 
 	// define worker routine
 	consumer := func() {
 		defer close(counts) // close when done
+		defer done.Done()   // signal when done
 
 		// connect to server
-		conn := dial(url)
+		// dial(url, blockings, cancels, closings, flows, returns)
+		conn := dial(url, false, false, false, false, false)
 		defer conn.Close()
-		ch := channel(conn)
-		defer ch.Close()
+		ch := conn.Channel
 
 		// declare queue (create if non-existent)
 		// QueueDeclare(name, durable, autoDelete, exclusive, noWait, args)
@@ -117,12 +201,13 @@ func startConsumer(url, queue string, numMsgs int64, quit chan int) (counts chan
 	}
 
 	// start worker routine
+	done.Add(1) // he who goes, adds (first)
 	go consumer()
 	return
 }
 
 ///////////////////////////////////////////
-// counter
+// helpers
 ///////////////////////////////////////////
 
 // drains the <counts> channel, printing every so often
@@ -146,7 +231,7 @@ func counter(counts chan int64, every int64, label string, done *syncutil.Waiter
 func main() {
 	const URL string = "amqp://guest:guest@localhost"
 	const QUEUE string = "test"
-	const COUNT_EVERY int64 = 1000
+	const COUNT_EVERY int64 = 5000
 
 	// get cmdline options
 	numMsgs, publish, consume, wait, ok := parseCmdLine()
@@ -159,18 +244,18 @@ func main() {
 	quit := make(chan int)
 	var done syncutil.Waiter
 	if publish {
-		counts := startPublisher(URL, QUEUE, numMsgs, quit) // runs until told to quit if numMsgs < 0
-		done.Add(1)                                         // he who goes, adds (first)
-		go counter(counts, COUNT_EVERY, "published", &done) // runs until <counts> closed (upstream)
+		counts := startPublisher(URL, QUEUE, numMsgs, quit, &done) // runs until told to quit if numMsgs < 0
+		done.Add(1)                                                // he who goes, adds (first)
+		go counter(counts, COUNT_EVERY, "published", &done)        // runs until <counts> closed (upstream)
 		if wait {
 			// wait for pipeline to be done before proceeding
 			waitWithInterrupt(&done, func() { quit <- 0 }) // signal quit on SIGINT (only one routine to signal, and we may need it later)
 		}
 	}
 	if consume {
-		counts := startConsumer(URL, QUEUE, numMsgs, quit) // runs until told to quit if numMsgs < 0
-		done.Add(1)                                        // he who goes, adds (first)
-		go counter(counts, COUNT_EVERY, "consumed", &done) // runs until <counts> closed (upstream)
+		counts := startConsumer(URL, QUEUE, numMsgs, quit, &done) // runs until told to quit if numMsgs < 0
+		done.Add(1)                                               // he who goes, adds (first)
+		go counter(counts, COUNT_EVERY, "consumed", &done)        // runs until <counts> closed (upstream)
 	}
 
 	// wait for everything to complete, and handle SIGINT
@@ -248,26 +333,21 @@ func parseCmdLine() (numMsgs int64, publish, consume, wait, ok bool) {
 // Helper functions:  wrappers with simple error handling
 ///////////////////////////////////////////////////////////////////////////
 
-func dial(url string) (conn *amqp.Connection) {
-	conn, err := amqp.Dial(url)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR from amqp.Dial():  %s\n", err.Error())
-		panic(err)
+func dial(url string, blockings, cancels, closings, flows, returns bool) (conn *amqputil.Connection) {
+	conn, derr, cherr := amqputil.Dial(url, blockings, cancels, closings, flows, returns)
+	if derr != nil {
+		fmt.Fprintf(os.Stderr, "ERROR from amqp.Dial():  %s\n", derr.Error())
+		panic(derr)
+	}
+	if cherr != nil {
+		fmt.Fprintf(os.Stderr, "ERROR from amqp.Connection.Channel():  %s\n", cherr.Error())
+		panic(cherr)
 	}
 	return
 }
 
-func channel(conn *amqp.Connection) (ch *amqp.Channel) {
-	ch, err := conn.Channel()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR from amqp.Connection.Channel():  %s\n", err.Error())
-		panic(err)
-	}
-	return
-}
-
-func queuedeclare(ch *amqp.Channel, name string, durable, autoDelete, exclusive, noWait bool, args amqp.Table) (queue amqp.Queue) {
-	queue, err := ch.QueueDeclare(name, durable, autoDelete, exclusive, noWait, args)
+func queuedeclare(ch *amqputil.Channel, name string, durable, autoDelete, exclusive, noWait bool, args amqp.Table) (queue amqp.Queue) {
+	queue, err := ch.Ch.QueueDeclare(name, durable, autoDelete, exclusive, noWait, args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR from amqp.Channel.QueueDeclare():  %s\n", err.Error())
 		panic(err)
@@ -275,8 +355,8 @@ func queuedeclare(ch *amqp.Channel, name string, durable, autoDelete, exclusive,
 	return
 }
 
-func queueinspect(ch *amqp.Channel, name string) (queue amqp.Queue) {
-	queue, err := ch.QueueInspect(name)
+func queueinspect(ch *amqputil.Channel, name string) (queue amqp.Queue) {
+	queue, err := ch.Ch.QueueInspect(name)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR from amqp.Channel.QueueInspect():  %s\n", err.Error())
 		panic(err)
@@ -284,16 +364,16 @@ func queueinspect(ch *amqp.Channel, name string) (queue amqp.Queue) {
 	return
 }
 
-func publish(ch *amqp.Channel, exchange, key string, mandatory, immediate bool, msg amqp.Publishing) {
-	err := ch.Publish(exchange, key, mandatory, immediate, msg)
+func publish(ch *amqputil.Channel, exchange, key string, mandatory, immediate bool, msg amqp.Publishing) {
+	err := ch.Ch.Publish(exchange, key, mandatory, immediate, msg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR from amqp.Channel.Publish():  %s\n", err.Error())
 		panic(err)
 	}
 }
 
-func consume(ch *amqp.Channel, queue, consumer string, autoAck, exclusive, noLocal, noWait bool, args amqp.Table) (deliveries <-chan amqp.Delivery) {
-	deliveries, err := ch.Consume(queue, consumer, autoAck, exclusive, noLocal, noWait, args)
+func consume(ch *amqputil.Channel, queue, consumer string, autoAck, exclusive, noLocal, noWait bool, args amqp.Table) (deliveries <-chan amqp.Delivery) {
+	deliveries, err := ch.Ch.Consume(queue, consumer, autoAck, exclusive, noLocal, noWait, args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR from amqp.Channel.Consume():  %s\n", err.Error())
 		panic(err)
