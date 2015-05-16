@@ -31,8 +31,8 @@ func startPublisher(url, queue string, numToSend int64, quit chan int, done *syn
 		defer done.Done()   // signal when done
 
 		// connect to server
-		// dial(url, blockings, cancels, closings, flows, returns)
-		conn := dial(url, true, true, true, true, true)
+		// dial(url, blockings, cancels, closings, flows, returns, confirms)
+		conn := dial(url, true, true, true, true, true, 1000)
 		defer conn.Close()
 		ch := conn.Channel
 
@@ -71,17 +71,17 @@ func startPublisher(url, queue string, numToSend int64, quit chan int, done *syn
 
 		// event loop
 	loop:
-		for numToSend < 0 || num < numToSend { // stop after numMsgs if >=0
+		for numToSend < 0 || num < numToSend { // stop after numToSend if >=0
 			select {
 			case <-quit: // quit signaled?
 				fmt.Println("PUBLISHER:  got quit signal")
-				break loop // not just the select
+				break loop
 			case c := <-ch.Cancels: // basic.cancel on channel
 				fmt.Printf("PUBLISHER:  got basic.cancel on '%s'\n", c)
-				break loop // not just the select
+				break loop
 			case c := <-ch.Closings: // connection or channel exception
 				fmt.Printf("PUBLISHER:  got connection/channel exception: %v\n", c)
-				break loop // not just the select
+				break loop
 			case f := <-ch.Flows: // basic.flow methods (RabbitMQ does TCP blocking instead)
 				if f {
 					fmt.Println("PUBLISHER:  got basic.flow=true; pausing...")
@@ -91,6 +91,10 @@ func startPublisher(url, queue string, numToSend int64, quit chan int, done *syn
 				pausing = f
 			case r := <-ch.Returns: // basic.return = msg undeliverable
 				fmt.Printf("PUBLISHER:  got basic.return (msg undeliverable): %s\n", r.Body)
+			case a := <-ch.Acks: // basic.ack (seq#)
+				fmt.Printf("PUBLISHER:  got basic.ack (%v)\n", a)
+			case n := <-ch.Nacks: // basic.nack (seq#)
+				fmt.Printf("PUBLISHER:  got basic.nack (%v)\n", n)
 			case e := <-presults: // result from publisher
 				handlePublishResult(e)
 			default: // no signals/events
@@ -148,7 +152,7 @@ func publisher(ch *amqputil.Channel, queue string, msgs chan *amqp.Publishing, e
 	// publish from input
 	for msg := range msgs {
 		// Publish(exchange, key, mandatory, immediate, msg)
-		errs <- ch.Ch.Publish("", queue, true, false, *msg)
+		errs <- ch.Publish("", queue, true, false, *msg)
 	}
 }
 
@@ -158,9 +162,9 @@ func publisher(ch *amqputil.Channel, queue string, msgs chan *amqp.Publishing, e
 
 // consumes messages from queue on rabbit server at <url>
 // outputs counts of successful messages read on <counts>
-// runs until <quit> is signaled or <numMsgs> read (if numMsgs >= 0)
+// runs until <quit> is signaled or <numToRecv> read (if numToRecv >= 0)
 // closes <counts> and signals <done> when done
-func startConsumer(url, queue string, numMsgs int64, quit chan int, done *syncutil.Waiter) (counts chan int64) {
+func startConsumer(url, queue string, numToRecv int64, quit chan int, done *syncutil.Waiter) (counts chan int64) {
 	counts = make(chan int64, 1000)
 
 	// define worker routine
@@ -169,8 +173,8 @@ func startConsumer(url, queue string, numMsgs int64, quit chan int, done *syncut
 		defer done.Done()   // signal when done
 
 		// connect to server
-		// dial(url, blockings, cancels, closings, flows, returns)
-		conn := dial(url, false, false, false, false, false)
+		// dialtoconsume(url, closings)
+		conn := dialtoconsume(url, true)
 		defer conn.Close()
 		ch := conn.Channel
 
@@ -179,25 +183,34 @@ func startConsumer(url, queue string, numMsgs int64, quit chan int, done *syncut
 		q := queuedeclare(ch, queue, false, false, false, false, nil)
 		fmt.Printf("CONSUMER:  queue '%s' has %d messages to start\n", queue, q.Messages)
 
+		// loop reading msgs
 		// Consume(queue, consumer, autoAck, exclusive, noLocal, noWait, args)
 		deliveries := consume(ch, queue, "", false, false, false, true, nil)
-		// read msgs until told to quit
-		var i int64
+		var num int64
 	loop:
-		for numMsgs < 0 || i < numMsgs { // stop after numMsgs if >= 0
+		for numToRecv < 0 || num < numToRecv { // stop after numToRecv if >= 0
 			select {
 			case <-quit: // quit signaled?
 				fmt.Println("CONSUMER:  got quit signal")
-				break loop // not just the select
-			case delivery := <-deliveries:
+				break loop
+			case c := <-ch.Closings: // connection or channel exception
+				fmt.Printf("CONSUMER:  got connection/channel exception: %v\n", c)
+				break loop
+			case delivery, ok := <-deliveries:
 				//fmt.Printf("Received message (%s):  %s\n", delivery.Timestamp, delivery.Body)
-				ack(&delivery, false) // we set autoAck to false above
-				i++
-				counts <- i
+				switch {
+				case ok: // got a message
+					ack(&delivery, false) // we set autoAck to false above
+					num++
+					counts <- num
+				case !ok: // channel closed (we'll usually get exception on Closings first)
+					fmt.Println("CONSUMER:  delivery channel closed")
+					break loop
+				}
 			}
 		}
 
-		fmt.Printf("CONSUMER:  %v msgs received successfully; exiting\n", i)
+		fmt.Printf("CONSUMER:  %v msgs received successfully; exiting\n", num)
 	}
 
 	// start worker routine
@@ -333,8 +346,8 @@ func parseCmdLine() (numMsgs int64, publish, consume, wait, ok bool) {
 // Helper functions:  wrappers with simple error handling
 ///////////////////////////////////////////////////////////////////////////
 
-func dial(url string, blockings, cancels, closings, flows, returns bool) (conn *amqputil.Connection) {
-	conn, derr, cherr := amqputil.Dial(url, blockings, cancels, closings, flows, returns)
+func dial(url string, blockings, cancels, closings, flows, returns bool, confirms int) (conn *amqputil.Connection) {
+	conn, derr, cherr := amqputil.Dial(url, blockings, cancels, closings, flows, returns, confirms)
 	if derr != nil {
 		fmt.Fprintf(os.Stderr, "ERROR from amqp.Dial():  %s\n", derr.Error())
 		panic(derr)
@@ -346,8 +359,12 @@ func dial(url string, blockings, cancels, closings, flows, returns bool) (conn *
 	return
 }
 
+func dialtoconsume(url string, closings bool) (conn *amqputil.Connection) {
+	return dial(url, false, false, closings, false, false, -1)
+}
+
 func queuedeclare(ch *amqputil.Channel, name string, durable, autoDelete, exclusive, noWait bool, args amqp.Table) (queue amqp.Queue) {
-	queue, err := ch.Ch.QueueDeclare(name, durable, autoDelete, exclusive, noWait, args)
+	queue, err := ch.QueueDeclare(name, durable, autoDelete, exclusive, noWait, args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR from amqp.Channel.QueueDeclare():  %s\n", err.Error())
 		panic(err)
@@ -356,7 +373,7 @@ func queuedeclare(ch *amqputil.Channel, name string, durable, autoDelete, exclus
 }
 
 func queueinspect(ch *amqputil.Channel, name string) (queue amqp.Queue) {
-	queue, err := ch.Ch.QueueInspect(name)
+	queue, err := ch.QueueInspect(name)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR from amqp.Channel.QueueInspect():  %s\n", err.Error())
 		panic(err)
@@ -365,7 +382,7 @@ func queueinspect(ch *amqputil.Channel, name string) (queue amqp.Queue) {
 }
 
 func publish(ch *amqputil.Channel, exchange, key string, mandatory, immediate bool, msg amqp.Publishing) {
-	err := ch.Ch.Publish(exchange, key, mandatory, immediate, msg)
+	err := ch.Publish(exchange, key, mandatory, immediate, msg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR from amqp.Channel.Publish():  %s\n", err.Error())
 		panic(err)
@@ -373,7 +390,7 @@ func publish(ch *amqputil.Channel, exchange, key string, mandatory, immediate bo
 }
 
 func consume(ch *amqputil.Channel, queue, consumer string, autoAck, exclusive, noLocal, noWait bool, args amqp.Table) (deliveries <-chan amqp.Delivery) {
-	deliveries, err := ch.Ch.Consume(queue, consumer, autoAck, exclusive, noLocal, noWait, args)
+	deliveries, err := ch.Consume(queue, consumer, autoAck, exclusive, noLocal, noWait, args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR from amqp.Channel.Consume():  %s\n", err.Error())
 		panic(err)
