@@ -29,43 +29,50 @@ func startPublisher(url, queue string, numToSend, every int64, quit chan int, do
 		//fmt.Println("PUBLISHER:  Manager routine started")
 
 		// connect to server
-		// dial(url, blockings, cancels, closings, flows, returns, confirms)
-		conn := dial(url, true, true, true, true, true, 1000)
-		defer conn.Close()
-		ch := conn.Channel
+		rp, err := amqputil.NewReliablePublisher(url)
+		panicOnError(err, "amqputil.NewReliablePublisher()")
+		defer rp.Close(10 * time.Second) // timeout
+
 		// declare queue (create if non-existent)
+		ch, err := rp.NewChannel(nil) // don't subscribe to events here
+		panicOnError(err, "amqputil.ReliablePublisher().NewChannel()")
+		defer ch.Close()
 		// QueueDeclare(name, durable, autoDelete, exclusive, noWait, args)
-		q := queuedeclare(ch, queue, false, false, false, false, nil)
+		q, err := ch.QueueDeclare(queue, false, false, false, false, nil)
+		panicOnError(err, "amqp.Channel.QueueDeclare()")
 		fmt.Printf("PUBLISHER:  queue '%s' has %d messages to start\n", queue, q.Messages)
 
-		// watch for server blocking (TCP flow control) in separate routine
-		done.Add(1)                            // he who goes, adds (first)
-		go blockingAgent(conn.Blockings, done) // blockings channel will close when connection closed
+		// register for amqp events (on rp channel)
+		connopts := &amqputil.ConnectionOptions{GetBlockings: true}
+		chanopts := &amqputil.ChannelOptions{GetClosings: true, GetFlows: true, GetReturns: true}
+		connevents, chanevents, err := rp.RegisterForEvents(connopts, chanopts)
+		panicOnError(err, "amqputil.ReliablePublisher.RegisterForEvents()")
 
 		// start publishing pipeline
 		myquit := make(chan int)     // used to shut down pipeline
 		mydone := &syncutil.Waiter{} // used to tell when pipeline is closed (esp. if numToSend satisfied)
-		msgs := startMessageGenerator(numToSend, myquit, mydone)
-		acked, nacked, errs := startReliablePublisher(ch, queue, msgs, mydone)
-		startResultCounter(acked, nacked, errs, every, mydone)
+		requests := startRequestGenerator(queue, numToSend, myquit)
+		acked, nacked, err := rp.Run(requests)
+		panicOnError(err, "amqputil.ReliablePublisher.Run()")
+		startResultCounter(acked, nacked, every, mydone)
 		mydone_ch := mydone.WaitChannel() // closed when Wait() is satisfied
 
-		// event loop
+		// event loop (for message-independent control events)
+		// reliablePublisher handles message-specific events
 	loop:
 		for {
 			select {
 			case <-quit: // quit signaled?
 				fmt.Println("PUBLISHER:  got quit signal")
 				break loop
-			case c := <-ch.Cancels: // basic.cancel on channel
-				fmt.Printf("PUBLISHER:  got basic.cancel on '%s'\n", c)
-				break loop
-			case c := <-ch.Closings: // connection or channel exception
+			case b := <-connevents.Blockings(): // connection blocking events (for flow control)
+				fmt.Printf("PUBLISHER:  got connection blocking event:  active=%v, reason='%s'\n", b.Active, b.Reason)
+			case c := <-chanevents.Closings(): // connection or channel exception
 				fmt.Printf("PUBLISHER:  got connection/channel exception: %v\n", c)
 				break loop
-			case f := <-ch.Flows: // basic.flow methods (RabbitMQ does TCP blocking instead)
+			case f := <-chanevents.Flows(): // basic.flow methods (RabbitMQ does TCP blocking instead)
 				fmt.Printf("PUBLISHER:  got basic.flow=%v\n", f)
-			case r := <-ch.Returns: // basic.return = msg undeliverable (queue deleted?)
+			case r := <-chanevents.Returns(): // basic.return = msg undeliverable (queue deleted?)
 				fmt.Printf("PUBLISHER:  got basic.return (msg undeliverable): %s\n", r.Body)
 			case <-mydone_ch: // pipeline closed (probably because numToSend satisfied)
 				break loop
@@ -75,11 +82,25 @@ func startPublisher(url, queue string, numToSend, every int64, quit chan int, do
 		// shut down
 		close(myquit) // signal generator (head of pipeline)
 		select {
-		case <-mydone_ch: // wait for everyone
-		case <-time.NewTimer(10 * time.Second).C: // timeout
+		case <-mydone_ch: // wait for counter (end of pipeline)
+		case <-time.After(10 * time.Second): // timeout
 			fmt.Println("PUBLISHER:  ERROR:  timed out waiting for routines to exit")
 		}
-		//fmt.Println("PUBLISHER:  Manager routine exiting")
+
+		// get result from ReliablePublisher
+		ok := rp.Wait(0)
+		switch {
+		case !ok: // timeout
+			fmt.Println("PUBLISHER:  ERROR:  timed out waiting for ReliablePublisher to exit")
+		default:
+			rperr, outstanding := rp.GetError()
+			if rperr != nil {
+				fmt.Println("PUBLISHER:  ERROR:  ReliablePublisher exited with error: ", rperr)
+			}
+			if len(outstanding) > 0 {
+				fmt.Printf("PUBLISHER:  ERROR:  ReliablePublisher exited with %v messages outstanding\n", len(outstanding))
+			}
+		}
 	}
 
 	// start worker routine
@@ -87,31 +108,15 @@ func startPublisher(url, queue string, numToSend, every int64, quit chan int, do
 	go manager()
 }
 
-// watches for connection blocking events
-// reads until <blockings> channel is closed (probably at connection close)
-// signals <done> when done
-func blockingAgent(blockings chan amqp.Blocking, done *syncutil.Waiter) {
-	defer done.Done() // signal when done
-	//fmt.Println("PUBLISHER:  blocking agent routine started")
-
-	// watch flor blocking events
-	for b := range blockings {
-		fmt.Printf("PUBLISHER:  got connection Blocking event, active=%v, reason='%s'\n", b.Active, b.Reason)
-	}
-	//fmt.Println("PUBLISHER:  blocking agent routine exiting")
-}
-
 // starts a routine to generate messages to publish
 // quits after <numMsgs> msgs, unless < 0
 // quits when <quit> signaled
-// signals <done> when done
-func startMessageGenerator(numMsgs int64, quit chan int, done *syncutil.Waiter) (msgs chan *amqp.Publishing) {
-	msgs = make(chan *amqp.Publishing) // capacity=0, to minimize the number of messages buffered in the pipeline
+// closes output on exit
+func startRequestGenerator(queue string, numMsgs int64, quit chan int) <-chan *amqputil.PublishRequest {
+	requests := make(chan *amqputil.PublishRequest) // capacity=0, to minimize the number of messages buffered in the pipeline
 
 	messageGenerator := func() {
-		defer done.Done() // signal when done
-		defer close(msgs) // close channel when done
-		//fmt.Println("PUBLISHER:  message generator routine started")
+		defer close(requests) // close channel when done
 
 		// run until numMsgs sent, unless < 0
 		for i := int64(0); numMsgs < 0 || i < numMsgs; i++ {
@@ -121,188 +126,64 @@ func startMessageGenerator(numMsgs int64, quit chan int, done *syncutil.Waiter) 
 				ContentType:  "text/plain",
 				Body:         []byte(fmt.Sprintf("Hello! (%v)", i)),
 			}
+			req := &amqputil.PublishRequest{
+				Exchange:  "",
+				Key:       queue,
+				Mandatory: false,
+				Immediate: false,
+				Message:   msg,
+			}
+
+			// push request onto channel (or quit)
 			select {
 			case <-quit: // quit signaled
 				return
-			case msgs <- msg:
+			case requests <- req:
 				continue
 			}
 		}
-		//fmt.Println("PUBLISHER:  message generator routine exiting")
 	}
 
-	done.Add(1) // he who goes, adds (first)
 	go messageGenerator()
-	return
-}
-
-// for returning publishing errors
-type pubResult struct {
-	E error
-	P *amqp.Publishing
-}
-
-// starts a goroutine to handle reliable publishing
-// this routine must be the first to publish anything on the channel after it is put into Confirm mode
-// will handle the Acks & Nacks channels on <ch> (nobody else should)
-// takes input off <msgs>, and writes output to <acked> & <nacked>
-// writes publishing errors to <errs>
-// runs until <msgs> is closed, and signals <done> on exit
-func startReliablePublisher(ch *amqputil.Channel, queue string, msgs chan *amqp.Publishing, done *syncutil.Waiter) (acked, nacked chan *amqp.Publishing, errs chan *pubResult) {
-	acked = make(chan *amqp.Publishing, 100)
-	nacked = make(chan *amqp.Publishing, 100)
-	errs = make(chan *pubResult, 100)
-
-	// define worker routine
-	reliablePublisher := func() {
-		defer done.Done() // signal done on exit
-		defer close(acked)
-		defer close(nacked)
-		defer close(errs)
-		//fmt.Println("PUBLISHER:  reliable publisher routine started")
-
-		// for managing publisher routine
-		// lock-step signaling (req/rep pattern)
-		topublish := make(chan *amqp.Publishing) // capacity=0 so we're never queuing requests internally
-		pubresults := make(chan error, 1)        // capacity=1 so we can queue one response (so publisher can always exit)
-		defer close(topublish)                   // will signal routine to stop
-
-		// define raw publisher routine (because Publish() may block)
-		// reads input from <msgs>, writes results to <errors>
-		// reads until <msgs> closed
-		// signals <done> on exit
-		publisher := func() {
-			defer done.Done() // signal when done
-			//fmt.Println("PUBLISHER:  raw publisher routine started")
-			for p := range topublish {
-				// Publish(exchange, key, mandatory, immediate, msg)
-				pubresults <- ch.Publish("", queue, true, false, *p) // may block
-			}
-			//fmt.Println("PUBLISHER:  raw publisher routine exiting")
-		}
-		done.Add(1) // he who goes, adds (first)
-		go publisher()
-
-		// loop, publishing messages
-		var lastseqnum uint64 = 0                    // first is 1
-		outstanding := map[uint64]*amqp.Publishing{} // keyed on sequence number
-		ready := true                                // publish routine ready?
-		quitting := false
-	loop:
-		for {
-			select {
-			case acknum, ok := <-ch.Acks: // got an ack (or ack channel closed)
-				if ok { // ack
-					msg, ok := outstanding[acknum] // get message acked
-					if ok {
-						delete(outstanding, acknum) // remove it from the map
-						acked <- msg                // send it to output channel
-					} else { // not found
-						fmt.Println("PUBLISHER:  ERROR:  received unexpected ack:", acknum)
-					}
-				} else { // ack channel closed (probably resulting from channel close exception)
-					fmt.Println("PUBLISHER:  ack channel closed unexpectedly")
-					break loop
-				}
-			case nacknum, ok := <-ch.Nacks: // got a nack (or nack channel closed)
-				if ok { // nack
-					msg, ok := outstanding[nacknum] // get message nacked
-					if ok {
-						delete(outstanding, nacknum) // remove it from the map
-						nacked <- msg                // send it to output channel
-					} else { // not found
-						fmt.Println("PUBLISHER:  ERROR:  received unexpected nack:", nacknum)
-					}
-				} else { // nack channel closed (probably resulting from channel close exception)
-					fmt.Println("PUBLISHER:  ERROR:  nack channel closed unexpectedly")
-					break loop
-				}
-			case err := <-pubresults: // got a result from publisher
-				ready = true    // for next publish
-				if err != nil { // error
-					msg := outstanding[lastseqnum]  // get last message
-					delete(outstanding, lastseqnum) // remove it from the map
-					errs <- &pubResult{err, msg}    // send it to error output channel
-				}
-			default: // no acks/nacks/pubresults
-				switch {
-				case quitting: // still have to handle acks/nacks in flight
-					if len(outstanding) == 0 { // done
-						break loop
-					} else { // keep going
-						time.Sleep(time.Millisecond)
-					}
-				case !ready: // waiting for a response from publisher routine
-					time.Sleep(time.Microsecond) // and continue
-				default: // running & ready
-					select { // try to get next msg to publish
-					case msg, ok := <-msgs: // got one (or channel closed)
-						if ok { // got one
-							topublish <- msg              // send it to publisher
-							ready = false                 // publisher busy
-							lastseqnum++                  // update seqnum
-							outstanding[lastseqnum] = msg // put it in the map
-						} else { // input closed
-							quitting = true // continue looping to handle remaining acks/nacks
-							fmt.Printf("PUBLISHER:  handling acks for %v outstanding msgs before exiting\n", len(outstanding))
-						}
-					}
-				}
-			}
-		}
-
-		if len(outstanding) > 0 {
-			fmt.Printf("PUBLISHER:  WARNING:  exiting with %v msgs not acked/nacked\n", len(outstanding))
-		}
-		//fmt.Println("PUBLISHER:  reliable publisher routine exiting")
-	}
-
-	// start worker routine
-	done.Add(1) // he who goes, adds (first)
-	go reliablePublisher()
-	return
+	return requests
 }
 
 // handles acks/nacks/errs for reliable publishing
 // reads until channels closed
 // signals <done> when done
-func startResultCounter(acked, nacked chan *amqp.Publishing, errs chan *pubResult, every int64, done *syncutil.Waiter) {
+func startResultCounter(acked, nacked <-chan *amqputil.PublishResult, every int64, done *syncutil.Waiter) {
 	resultCounter := func() {
 		defer done.Done() // signal when done
-		//fmt.Println("PUBLISHER:  result counter routine started")
 
 		// read from channels until all are closed
-		var numAcks, numNacks, numErrs int64
-		for acked != nil || nacked != nil || errs != nil { // we'll nil them as they're closed
+		var numAcked, numNacked, numErrs int64
+		for acked != nil || nacked != nil { // we'll nil them as they're closed
 			select {
 			case _, ok := <-acked: // got an ack (or channel closed)
-				if ok {
-					numAcks++ // ack
-					if numAcks%every == 0 {
-						fmt.Printf("PUBLISHER:  %v msgs successfully sent\n", numAcks)
+				switch {
+				case !ok: // channel closed
+					acked = nil
+				default: // acked msg
+					numAcked++
+					if numAcked%every == 0 {
+						fmt.Printf("PUBLISHER:  %v msgs successfully sent\n", numAcked)
 					}
-				} else {
-					acked = nil // closed
 				}
-			case p, ok := <-nacked: // got a nack (or channel closed)
-				if ok {
-					numNacks++ // nack
-					fmt.Printf("PUBLISHER:  got a nack for msg:  %s\n", p.Body)
-				} else {
-					nacked = nil // closed
-				}
-			case pr, ok := <-errs: // got an error (or channed closed)
-				if ok {
-					numErrs++ // error
-					fmt.Printf("PUBLISHER:  ERROR received attempting to send msg:  %s:  %s\n", pr.E.Error(), pr.P.Body)
-				} else {
-					errs = nil // closed
+			case pr, ok := <-nacked: // got a nack (or channel closed)
+				switch {
+				case !ok: // channel closed
+					nacked = nil
+				case pr.Error != nil: // msg error
+					numErrs++
+					fmt.Printf("PUBLISHER:  ERROR received attempting to send msg %v:  %s:  %s\n", pr.RequestNum, pr.Error, pr.Request.Message.Body)
+				default: // nacked msg
+					numNacked++ // nack
+					fmt.Printf("PUBLISHER:  got a nack for msg %v:  %s\n", pr.Request.Message.Body)
 				}
 			}
 		}
 
-		fmt.Printf("PUBLISHER:  %v msgs acked, %v nacked, %v errors\n", numAcks, numNacks, numErrs)
-		//fmt.Println("PUBLISHER:  result counter routine exiting")
+		fmt.Printf("PUBLISHER:  %v msgs acked, %v nacked, %v errors\n", numAcked, numNacked, numErrs)
 	}
 	done.Add(1) // he who goes, adds (first)
 	go resultCounter()
@@ -325,19 +206,21 @@ func startConsumer(url, queue string, numToRecv int64, quit chan int, done *sync
 		defer done.Done()   // signal when done
 
 		// connect to server
-		// dialtoconsume(url, closings)
-		conn := dialtoconsume(url, true)
+		conn, err := amqputil.DialToConsume(url, true, true) // get cancels, closings
+		panicOnError(err, "amqputil.DialToConsume()")
 		defer conn.Close()
-		ch := conn.Channel
+		ch := conn.Channel()
 
 		// declare queue (create if non-existent)
 		// QueueDeclare(name, durable, autoDelete, exclusive, noWait, args)
-		q := queuedeclare(ch, queue, false, false, false, false, nil)
+		q, err := ch.QueueDeclare(queue, false, false, false, false, nil)
+		panicOnError(err, "amqp.Channel.QueueDeclare()")
 		fmt.Printf("CONSUMER:  queue '%s' has %d messages to start\n", queue, q.Messages)
 
 		// loop reading msgs
 		// Consume(queue, consumer, autoAck, exclusive, noLocal, noWait, args)
-		deliveries := consume(ch, queue, "", false, false, false, true, nil)
+		deliveries, err := ch.Consume(queue, "", false, false, false, true, nil)
+		panicOnError(err, "amqp.Channel.Consume()")
 		var num int64
 	loop:
 		for numToRecv < 0 || num < numToRecv { // stop after numToRecv if >= 0
@@ -345,14 +228,17 @@ func startConsumer(url, queue string, numToRecv int64, quit chan int, done *sync
 			case <-quit: // quit signaled?
 				fmt.Println("CONSUMER:  got quit signal")
 				break loop
-			case c := <-ch.Closings: // connection or channel exception
-				fmt.Printf("CONSUMER:  got connection/channel exception: %v\n", c)
+			case c := <-ch.CancelEvents(): // cancel event
+				fmt.Printf("CONSUMER:  got basic.cancel event:  %s\n", c)
 				break loop
-			case delivery, ok := <-deliveries:
-				//fmt.Printf("Received message (%s):  %s\n", delivery.Timestamp, delivery.Body)
+			case c := <-ch.CloseEvents(): // connection or channel exception
+				fmt.Printf("CONSUMER:  got connection/channel exception:  %v\n", c)
+				break loop
+			case delivery, ok := <-deliveries: // delivery (or channel closed)
 				switch {
 				case ok: // got a message
-					ack(&delivery, false) // we set autoAck to false above
+					err = delivery.Ack(false) // because we set autoAck to false above
+					panicOnError(err, "amqp.Delivery.Ack()")
 					num++
 					counts <- num
 				case !ok: // channel closed (we'll usually get exception on Closings first)
@@ -389,13 +275,18 @@ func consumerCounter(counts chan int64, every int64, done *syncutil.Waiter) {
 // main
 ///////////////////////////////////////////
 
+const (
+	URL         string = "amqp://guest:guest@localhost"
+	QUEUE       string = "test"
+	COUNT_EVERY int64  = 5000
+)
+
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
+	test()
+}
 
-	const URL string = "amqp://guest:guest@localhost"
-	const QUEUE string = "test"
-	const COUNT_EVERY int64 = 5000
-
+func test() {
 	// get cmdline options
 	numMsgs, publish, consume, wait, ok := parseCmdLine()
 	if !ok {
@@ -422,6 +313,10 @@ func main() {
 	// wait for everything to complete, and handle SIGINT
 	waitWithInterrupt(&done, func() { close(quit) }) // close quit on SIGINT (perhaps multiple routines to signal)
 }
+
+/////////////////////////////////////////////////////////
+// Helper functions
+/////////////////////////////////////////////////////////
 
 // waits for <waitfor> before returning
 // handles SIGINT by calling <oninterrupt>() (and keeps waiting)
@@ -490,65 +385,8 @@ func parseCmdLine() (numMsgs int64, publish, consume, wait, ok bool) {
 	return
 }
 
-///////////////////////////////////////////////////////////////////////////
-// Helper functions:  wrappers with simple error handling
-///////////////////////////////////////////////////////////////////////////
-
-func dial(url string, blockings, cancels, closings, flows, returns bool, confirms int) (conn *amqputil.Connection) {
-	conn, derr, cherr := amqputil.Dial(url, blockings, cancels, closings, flows, returns, confirms)
-	if derr != nil {
-		fmt.Printf("ERROR from amqp.Dial():  %s\n", derr.Error())
-		panic(derr)
-	}
-	if cherr != nil {
-		fmt.Printf("ERROR from amqp.Connection.Channel():  %s\n", cherr.Error())
-		panic(cherr)
-	}
-	return
-}
-
-func dialtoconsume(url string, closings bool) (conn *amqputil.Connection) {
-	return dial(url, false, false, closings, false, false, -1)
-}
-
-func queuedeclare(ch *amqputil.Channel, name string, durable, autoDelete, exclusive, noWait bool, args amqp.Table) (queue amqp.Queue) {
-	queue, err := ch.QueueDeclare(name, durable, autoDelete, exclusive, noWait, args)
+func panicOnError(err error, label string) {
 	if err != nil {
-		fmt.Printf("ERROR from amqp.Channel.QueueDeclare():  %s\n", err.Error())
-		panic(err)
-	}
-	return
-}
-
-func queueinspect(ch *amqputil.Channel, name string) (queue amqp.Queue) {
-	queue, err := ch.QueueInspect(name)
-	if err != nil {
-		fmt.Printf("ERROR from amqp.Channel.QueueInspect():  %s\n", err.Error())
-		panic(err)
-	}
-	return
-}
-
-func publish(ch *amqputil.Channel, exchange, key string, mandatory, immediate bool, msg amqp.Publishing) {
-	err := ch.Publish(exchange, key, mandatory, immediate, msg)
-	if err != nil {
-		fmt.Printf("ERROR from amqp.Channel.Publish():  %s\n", err.Error())
-		panic(err)
-	}
-}
-
-func consume(ch *amqputil.Channel, queue, consumer string, autoAck, exclusive, noLocal, noWait bool, args amqp.Table) (deliveries <-chan amqp.Delivery) {
-	deliveries, err := ch.Consume(queue, consumer, autoAck, exclusive, noLocal, noWait, args)
-	if err != nil {
-		fmt.Printf("ERROR from amqp.Channel.Consume():  %s\n", err.Error())
-		panic(err)
-	}
-	return
-}
-
-func ack(delivery *amqp.Delivery, multiple bool) {
-	err := delivery.Ack(multiple)
-	if err != nil {
-		fmt.Printf("ERROR from amqp.Delivery.Ack():  %s\n", err.Error())
+		panic(fmt.Errorf("ERROR from %s:  %s", label, err))
 	}
 }
